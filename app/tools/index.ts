@@ -1,8 +1,11 @@
 import { ExaSearchTool } from './exa_search';
 import type { Tool } from './base';
 
-// 导出一个所有可用工具的数组
-export const tools: Tool[] = [new ExaSearchTool()];
+export const tools: Tool[] = [];
 
-// 创建一个Map，方便在Agent中按名称快速查找工具
+if (process.env.EXA_API_KEY && !/YOUR-EXA-API-KEY/.test(process.env.EXA_API_KEY)) {
+  tools.push(new ExaSearchTool());
+}
+
+// Tool Map for LLM quick lookup by name
 export const toolMap = new Map(tools.map(tool => [tool.name, tool]));
