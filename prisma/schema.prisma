@@ -1,0 +1,32 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model ChatSession {
+  id        String   @id @default(uuid())
+  title     String?  // Optional title for the conversation
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  messages  Message[]
+}
+
+model Message {
+  id          Int         @id @default(autoincrement())
+  role        String      // "user", "assistant", "tool", "tool_call", "tool_result"
+  content     String
+  toolName    String?     // Name of the tool if this is a tool-related message
+  toolArgs    String?     // JSON string of tool arguments
+  toolResult  String?     // JSON string of tool result
+  isCollapsed Boolean     @default(false) // Whether tool call is collapsed in UI
+  createdAt   DateTime    @default(now())
+  session     ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionId   String
+}
