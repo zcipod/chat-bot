@@ -6,7 +6,7 @@ import { useChatMessages } from "~/hooks/useChatMessages";
 import { useChatSessions } from "~/hooks/useChatSessions";
 
 export function ChatDialogue({models}: { models: any[] }) {
-  const [model, setModel] = useState("gpt-4o-mini");
+  const [model, setModel] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -45,6 +45,15 @@ export function ChatDialogue({models}: { models: any[] }) {
       loadSessions();
     },
   });
+
+  // Set default model when models are loaded
+  useEffect(() => {
+    if (models && models.length > 0 && !model) {
+      // Try to find a model with 'o4-mini' in the id, otherwise use the first model
+      const defaultModel = models.find(m => /4o-mini/.test(m.id)) || models[0];
+      setModel(defaultModel.id);
+    }
+  }, [models]);
 
   // Load session when URL changes
   useEffect(() => {

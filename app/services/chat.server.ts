@@ -1,7 +1,8 @@
-import { streamText, tool } from 'ai';
-import { openai } from './openai.server';
+import { openaiClient } from './openai.server';
 import { tools } from '~/tools';
 import { prisma } from './db.server';
+import type OpenAI from 'openai';
+import { zodToJsonSchema } from 'zod-to-json-schema';
 
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system' | 'tool_call' | 'tool_result';
@@ -18,12 +19,24 @@ export interface ChatRequest {
 }
 
 // Filter messages for LLM (remove tool_call and tool_result messages)
-function filterMessagesForLLM(messages: ChatMessage[]) {
+function filterMessagesForLLM(messages: ChatMessage[]): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
   return messages.filter(msg =>
     msg.role === 'user' || msg.role === 'assistant' || msg.role === 'system'
   ).map(msg => ({
     role: msg.role as 'user' | 'assistant' | 'system',
     content: msg.content,
+  }));
+}
+
+// Convert tools to OpenAI format
+function convertToolsToOpenAIFormat() {
+  return tools.map(tool => ({
+    type: 'function' as const,
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: zodToJsonSchema(tool.schema),
+    },
   }));
 }
 
@@ -61,24 +74,27 @@ export async function createChatStream(request: ChatRequest): Promise<ReadableSt
       };
 
       try {
-        const result = streamText({
-          model: openai(model || 'gpt-4o-mini'),
-          system: "You are a helpful assistant. When you use tools to gather information, you MUST always provide a comprehensive response based on the tool results. After calling a tool and receiving results, you MUST analyze and summarize the information for the user in a clear and helpful way. Never end your response with just a tool call - always follow up with explanatory text.",
-          messages: filteredMessages,
-          tools: tools.reduce((acc, t) => {
-            acc[t.name] = tool({
-              description: t.description,
-              inputSchema: t.schema,
-              execute: t.execute,
-            });
-            return acc;
-          }, {} as any),
-          toolChoice: 'auto',
-        });
+        // Prepare OpenAI chat completion request
+        const openaiTools = convertToolsToOpenAIFormat();
+        const systemMessage: OpenAI.Chat.Completions.ChatCompletionMessageParam = {
+          role: 'system',
+          content: "You are a helpful assistant. When you use tools to gather information, you MUST always provide a comprehensive response based on the tool results. After calling a tool and receiving results, you MUST analyze and summarize the information for the user in a clear and helpful way. Never end your response with just a tool call - always follow up with explanatory text."
+        };
 
-        // console.log('StreamText result created, starting to process fullStream');
+        const allMessages = [systemMessage, ...filteredMessages];
+
+        const chatParams: OpenAI.Chat.Completions.ChatCompletionCreateParams = {
+          model: model || 'gpt-4o-mini',
+          messages: allMessages,
+          stream: true,
+          tools: openaiTools.length > 0 ? openaiTools : undefined,
+          tool_choice: openaiTools.length > 0 ? 'auto' : undefined,
+        };
+
+        const result = await openaiClient.chat.completions.create(chatParams);
 
         let hasToolCalls = false;
+        const toolCalls: OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta.ToolCall[] = [];
         const toolResults: Array<{ toolName: string; result: string; tool?: any }> = [];
         let assistantMessageContent = '';
 
@@ -86,105 +102,154 @@ export async function createChatStream(request: ChatRequest): Promise<ReadableSt
         if (sessionId && filteredMessages.length > 0) {
           const lastMessage = filteredMessages[filteredMessages.length - 1];
           if (lastMessage.role === 'user') {
-            await saveMessage(sessionId, lastMessage);
+            await saveMessage(sessionId, {
+              role: lastMessage.role,
+              content: typeof lastMessage.content === 'string' ? lastMessage.content : JSON.stringify(lastMessage.content)
+            });
           }
         }
 
-        for await (const part of result.fullStream) {
-          // console.log('Processing stream part:', part.type);
+        for await (const chunk of result) {
+          const choice = chunk.choices[0];
+          if (!choice) continue;
 
-          if (part.type === 'tool-call') {
-            console.log('Tool call detected:', part.toolName, part.input);
+          const delta = choice.delta;
+
+          // Handle tool calls
+          if (delta.tool_calls) {
             hasToolCalls = true;
-            sendJSON({ type: 'tool_call', name: part.toolName, args: part.input });
+            for (const toolCall of delta.tool_calls) {
+              const index = toolCall.index;
 
-            // Save tool call message
-            if (sessionId) {
-              await saveMessage(sessionId, {
-                role: 'tool_call',
-                content: `Calling ${part.toolName}`,
-                toolName: part.toolName,
-                toolArgs: part.input,
-              });
+              // Initialize tool call if not exists
+              if (!toolCalls[index]) {
+                toolCalls[index] = {
+                  index: index,
+                  id: toolCall.id || '',
+                  type: 'function',
+                  function: { name: '', arguments: '' }
+                };
+              }
+
+              // Update tool call data
+              if (toolCall.function?.name) {
+                toolCalls[index].function!.name += toolCall.function.name;
+              }
+              if (toolCall.function?.arguments) {
+                toolCalls[index].function!.arguments += toolCall.function.arguments;
+              }
             }
-          } else if (part.type === 'tool-result') {
-            // console.log('Tool result received:', part.toolName, 'Output:', part.output);
-            // Find the tool instance for followup configuration
-            const toolInstance = tools.find(t => t.name === part.toolName);
-            // Store tool result for potential follow-up
-            toolResults.push({
-              toolName: part.toolName,
-              result: String(part.output),
-              tool: toolInstance
-            });
-            // Send tool result to frontend for debugging/transparency
-            sendJSON({ type: 'tool_result', name: part.toolName, result: part.output });
+          }
 
-            // Save tool result message
-            if (sessionId) {
-              await saveMessage(sessionId, {
-                role: 'tool_result',
-                content: `Tool result for ${part.toolName}`,
-                toolName: part.toolName,
-                toolResult: part.output,
-              });
-            }
-          } else if (part.type === 'text-delta') {
-            // console.log('Text delta received:', part.text);
-            assistantMessageContent += part.text;
-            sendJSON({ type: 'text_chunk', content: part.text });
-          } else if (part.type === 'finish') {
-            // console.log('Stream finished with reason:', part.finishReason);
+          // Handle text content
+          if (delta.content) {
+            assistantMessageContent += delta.content;
+            sendJSON({ type: 'text_chunk', content: delta.content });
+          }
 
-            // If we had tool calls but no text was generated, force a follow-up
-            // console.log('Checking follow-up conditions: hasToolCalls =', hasToolCalls, 'finishReason =', part.finishReason);
-            if (hasToolCalls && part.finishReason === 'tool-calls') {
-              // console.log('Tool calls finished without text, generating follow-up...');
+          // Handle finish reason
+          if (choice.finish_reason) {
+            // Execute tool calls if any
+            if (hasToolCalls && choice.finish_reason === 'tool_calls') {
+              // Execute all tool calls
+              for (const toolCall of toolCalls) {
+                if (toolCall.function?.name && toolCall.function?.arguments) {
+                  try {
+                    const toolName = toolCall.function.name;
+                    const toolArgs = JSON.parse(toolCall.function.arguments);
 
+                    console.log('Tool call detected:', toolName, toolArgs);
+                    sendJSON({ type: 'tool_call', name: toolName, args: toolArgs });
+
+                    // Save tool call message
+                    if (sessionId) {
+                      await saveMessage(sessionId, {
+                        role: 'tool_call',
+                        content: `Calling ${toolName}`,
+                        toolName: toolName,
+                        toolArgs: toolArgs,
+                      });
+                    }
+
+                    // Find and execute the tool
+                    const toolInstance = tools.find(t => t.name === toolName);
+                    if (toolInstance) {
+                      const result = await toolInstance.execute(toolArgs);
+
+                      // Store tool result for potential follow-up
+                      toolResults.push({
+                        toolName: toolName,
+                        result: result,
+                        tool: toolInstance
+                      });
+
+                      // Send tool result to frontend
+                      sendJSON({ type: 'tool_result', name: toolName, result: result });
+
+                      // Save tool result message
+                      if (sessionId) {
+                        await saveMessage(sessionId, {
+                          role: 'tool_result',
+                          content: `Tool result for ${toolName}`,
+                          toolName: toolName,
+                          toolResult: result,
+                        });
+                      }
+                    }
+                  } catch (error) {
+                    console.error('Tool execution error:', error);
+                    sendJSON({ type: 'error', message: `Tool execution failed: ${error}` });
+                  }
+                }
+              }
+              // Generate follow-up response with tool results
               // Check if any tools have followup configuration
               const toolsWithFollowup = toolResults.filter(result =>
                 result.tool?.followup?.enabled
               );
 
               if (toolsWithFollowup.length > 0) {
-                // console.log('Found tools with followup configuration:', toolsWithFollowup.map(t => t.toolName));
-
-                // Use the first tool's followup configuration (could be enhanced to merge multiple)
+                // Use the first tool's followup configuration
                 const primaryTool = toolsWithFollowup[0];
                 const followupConfig = primaryTool.tool.followup;
 
-                // Create a follow-up request with tool-specific configuration
-                // Include the tool results in the conversation history, with filtering if specified
-                const followUpMessages = [
-                  ...filteredMessages,
-                  ...toolResults.map(result => {
-                    const filteredResult = result.tool?.followup?.filterResult
-                      ? result.tool.followup.filterResult(result.result)
-                      : result.result;
+                // Create follow-up messages with tool results
+                const toolResultMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = toolResults.map(result => {
+                  const filteredResult = result.tool?.followup?.filterResult
+                    ? result.tool.followup.filterResult(result.result)
+                    : result.result;
 
-                    return {
-                      role: 'assistant' as const,
-                      content: `Tool ${result.toolName} executed with result: ${filteredResult}`
-                    };
-                  })
-                ];
-
-                const followUpResult = streamText({
-                  model: openai(model || 'gpt-4o-mini'),
-                  system: followupConfig.systemPrompt || "You are a helpful assistant. Based on the tool results in the conversation, provide a comprehensive and helpful response to the user's question. Analyze and summarize the information clearly.",
-                  messages: followUpMessages,
+                  return {
+                    role: 'assistant' as const,
+                    content: `Tool ${result.toolName} executed with result: ${filteredResult}`
+                  };
                 });
 
-                for await (const followUpPart of followUpResult.fullStream) {
-                  if (followUpPart.type === 'text-delta') {
-                    // console.log('Follow-up text delta:', followUpPart.text);
-                    assistantMessageContent += followUpPart.text;
-                    sendJSON({ type: 'text_chunk', content: followUpPart.text });
-                  } else if (followUpPart.type === 'finish') {
-                    // console.log('Follow-up finished');
-                    break;
-                  } else if (followUpPart.type === 'error') {
-                    console.error('Follow-up error:', followUpPart.error);
+                const followUpMessages = [
+                  {
+                    role: 'system' as const,
+                    content: followupConfig.systemPrompt || "You are a helpful assistant. Based on the tool results in the conversation, provide a comprehensive and helpful response to the user's question. Analyze and summarize the information clearly."
+                  },
+                  ...filteredMessages,
+                  ...toolResultMessages
+                ];
+
+                const followUpResult = await openaiClient.chat.completions.create({
+                  model: model || 'gpt-4o-mini',
+                  messages: followUpMessages,
+                  stream: true,
+                });
+
+                for await (const followUpChunk of followUpResult) {
+                  const followUpChoice = followUpChunk.choices[0];
+                  if (!followUpChoice) continue;
+
+                  if (followUpChoice.delta.content) {
+                    assistantMessageContent += followUpChoice.delta.content;
+                    sendJSON({ type: 'text_chunk', content: followUpChoice.delta.content });
+                  }
+
+                  if (followUpChoice.finish_reason) {
                     break;
                   }
                 }
@@ -192,7 +257,11 @@ export async function createChatStream(request: ChatRequest): Promise<ReadableSt
                 // Fallback to default followup behavior
                 console.log('No tools with followup configuration, using default behavior');
 
-                const followUpMessages = [
+                const defaultFollowUpMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+                  {
+                    role: 'system',
+                    content: "You are a helpful assistant. Based on the tool results in the conversation, provide a comprehensive and helpful response to the user's question. Analyze and summarize the information clearly."
+                  },
                   ...filteredMessages,
                   ...toolResults.map(result => ({
                     role: 'assistant' as const,
@@ -200,22 +269,22 @@ export async function createChatStream(request: ChatRequest): Promise<ReadableSt
                   }))
                 ];
 
-                const followUpResult = streamText({
-                  model: openai(model || 'gpt-4o-mini'),
-                  system: "You are a helpful assistant. Based on the tool results in the conversation, provide a comprehensive and helpful response to the user's question. Analyze and summarize the information clearly.",
-                  messages: followUpMessages,
+                const followUpResult = await openaiClient.chat.completions.create({
+                  model: model || 'gpt-4o-mini',
+                  messages: defaultFollowUpMessages,
+                  stream: true,
                 });
 
-                for await (const followUpPart of followUpResult.fullStream) {
-                  if (followUpPart.type === 'text-delta') {
-                    // console.log('Follow-up text delta:', followUpPart.text);
-                    assistantMessageContent += followUpPart.text;
-                    sendJSON({ type: 'text_chunk', content: followUpPart.text });
-                  } else if (followUpPart.type === 'finish') {
-                    // console.log('Follow-up finished');
-                    break;
-                  } else if (followUpPart.type === 'error') {
-                    console.error('Follow-up error:', followUpPart.error);
+                for await (const followUpChunk of followUpResult) {
+                  const followUpChoice = followUpChunk.choices[0];
+                  if (!followUpChoice) continue;
+
+                  if (followUpChoice.delta.content) {
+                    assistantMessageContent += followUpChoice.delta.content;
+                    sendJSON({ type: 'text_chunk', content: followUpChoice.delta.content });
+                  }
+
+                  if (followUpChoice.finish_reason) {
                     break;
                   }
                 }
@@ -230,12 +299,6 @@ export async function createChatStream(request: ChatRequest): Promise<ReadableSt
               });
             }
             break;
-          } else if (part.type === 'error') {
-            console.error('Stream error:', part.error);
-            sendJSON({ type: 'error', message: String(part.error) });
-            break;
-          } else {
-            console.log('Unknown stream part type:', part.type);
           }
         }
       } catch (e) {

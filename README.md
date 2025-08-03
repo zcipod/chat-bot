@@ -37,7 +37,28 @@ An intelligent chat application built with Remix, featuring OpenAI integration, 
 
 ## Development
 
-Run the dev server:
+### Database Setup
+
+This project uses SQLite with Prisma ORM. Before running the application, you need to set up the database:
+
+1. **Install dependencies:**
+   ```sh
+   npm install
+   ```
+
+2. **Initialize the database:**
+   ```sh
+   npx prisma migrate deploy
+   # or for development
+   npx prisma db push
+   ```
+
+3. **Optional: View database with Prisma Studio:**
+   ```sh
+   npx prisma studio
+   ```
+
+### Run the dev server:
 
 ```sh
 npm run dev
@@ -63,9 +84,16 @@ Key environment variables include:
 To build and run the application using Docker, make sure you have Docker installed and then run the following commands in the project root:
 
 ```sh
+# Copy environment variables
+cp .env.example .env
+# Edit .env with your API keys
+
+# Build and start the application
 docker-compose build
 docker-compose up
 ```
+
+**Note:** The Docker setup automatically initializes the SQLite database using `npx prisma migrate deploy` during container startup. The database files are persisted using Docker volumes.
 
 The application will be accessible at `http://localhost:3000`.
 

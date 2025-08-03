@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -11,7 +10,7 @@ interface ChatMessageProps {
   onToggleCollapse?: (index: number) => void;
 }
 
-export function ChatMessageComponent({ message, index, onToggleCollapse }: ChatMessageProps) {
+export function ChatMessageComponent({ message }: ChatMessageProps) {
 
   if (message.role === 'user') {
     return (

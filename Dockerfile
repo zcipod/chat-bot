@@ -21,8 +21,11 @@ COPY --from=builder /app/public ./public
 COPY --from=builder /app/.env.example ./.env.example
 COPY --from=builder /app/prisma ./prisma
 
+# Install Prisma CLI for database operations
+RUN npm install -g prisma
+
 # Expose the port the app runs on
 EXPOSE 3000
 
-# Command to start the app, using HOST environment variables
-CMD ["sh", "-c", "HOST=$HOST npm run start"]
+# Command to initialize database and start the app
+CMD ["sh", "-c", "npx prisma migrate deploy && HOST=$HOST npm run start"]
