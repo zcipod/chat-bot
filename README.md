@@ -1,6 +1,39 @@
-# Welcome to Remix!
+# AI Chat Bot
 
-- 📖 [Remix docs](https://remix.run/docs)
+An intelligent chat application built with Remix, featuring OpenAI integration, web search capabilities, and a modern responsive interface.
+
+![Chat Bot Screenshot](screenshot.png)
+
+## Features
+
+### 🤖 AI Conversation
+- **OpenAI Integration**: Powered by GPT models for intelligent conversations
+- **Multiple Model Support**: Choose from different OpenAI models for varied responses
+- **Streaming Responses**: Real-time message streaming for better user experience
+
+### 🔍 Web Search Integration
+- **Exa Search Tool**: Built-in web search capabilities using Exa API
+- **Tool Call Visualization**: Clear display of tool usage and results
+- **Collapsible Tool Details**: Keep conversations clean with expandable tool information
+
+### 💬 Session Management
+- **Persistent Chat Sessions**: All conversations are saved and can be resumed
+- **Automatic Titling**: AI-generated descriptive titles for each conversation
+- **Manual Renaming**: Edit conversation titles with inline editing
+- **Session History**: Access all previous conversations from the sidebar
+
+### 🎨 Modern UI/UX
+- **Responsive Design**: Optimized for both desktop and mobile devices
+- **Collapsible Sidebar**: Clean interface with expandable conversation history
+- **Dark/Light Theme Ready**: Built with Tailwind CSS for easy theming
+- **Markdown Support**: Rich text rendering with syntax highlighting
+
+### 🔧 Technical Features
+- **URL-based Routing**: Direct links to specific conversations
+- **Database Persistence**: PostgreSQL with Prisma ORM
+- **Docker Support**: Easy deployment with Docker Compose
+- **TypeScript**: Full type safety throughout the application
+
 
 ## Development
 
