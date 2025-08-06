@@ -2,6 +2,7 @@ import type { ActionFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import { openaiClient } from "~/services/openai.server";
 import { prisma } from "~/services/db.server";
+import { getTitleGenerator } from "~/services/models.server";
 
 export async function action({ request, params }: ActionFunctionArgs) {
   if (request.method !== 'POST') {
@@ -41,9 +42,11 @@ ${conversationText}
 
 Title:`;
 
+    // Get the title generator model
+    const titleModel = await getTitleGenerator();
     // Call OpenAI to generate title
     const response = await openaiClient.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: titleModel.id,
       messages: [
         {
           role: 'user',
