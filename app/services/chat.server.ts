@@ -1,5 +1,5 @@
 import { openaiClient } from './openai.server';
-import { tools } from '~/tools';
+import { tools, toolMap } from '~/tools';
 import { prisma } from './db.server';
 import type OpenAI from 'openai';
 import { zodToJsonSchema } from 'zod-to-json-schema';
@@ -17,6 +17,17 @@ export interface ChatRequest {
   model?: string;
   sessionId?: string;
 }
+
+interface ToolExecution {
+  toolName: string;
+  toolArgs: any;
+  result: string;
+  tool: any;
+  messageId?: number; // Database ID for the tool call message
+}
+
+// Get max tool call rounds from environment variable, default to 3
+const MAX_TOOL_CALL_ROUNDS = parseInt(process.env.MAX_TOOL_CALL_ROUNDS || '3');
 
 // Filter messages for LLM (remove tool_call and tool_result messages)
 function filterMessagesForLLM(messages: ChatMessage[]): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
@@ -38,6 +49,212 @@ function convertToolsToOpenAIFormat() {
       parameters: zodToJsonSchema(tool.schema),
     },
   }));
+}
+
+// Execute tool concurrently and handle all related operations
+async function executeToolConcurrently(
+  toolCall: any,
+  sessionId: string | undefined,
+  sendJSON: (data: object) => void
+): Promise<ToolExecution | null> {
+  if (!toolCall.function?.name || !toolCall.function?.arguments) {
+    console.error('Invalid tool call structure:', toolCall);
+    return null;
+  }
+
+  try {
+    const toolName = toolCall.function.name;
+    let toolArgs: any;
+    
+    try {
+      toolArgs = JSON.parse(toolCall.function.arguments);
+    } catch (parseError) {
+      console.error('Failed to parse tool arguments:', toolCall.function.arguments, parseError);
+      sendJSON({ type: 'error', message: `Invalid tool arguments: ${parseError}` });
+      return null;
+    }
+
+    console.log('Tool call detected:', toolName, toolArgs);
+    
+    // Insert tool call message into database immediately and get ID
+    let savedMessageId: number | undefined = undefined;
+    if (sessionId) {
+      const savedMessage = await prisma.message.create({
+        data: {
+          sessionId,
+          role: 'tool_call',
+          content: `Calling ${toolName}`,
+          toolName: toolName,
+          toolArgs: JSON.stringify(toolArgs),
+          toolResult: null, // Will be updated later
+          isCollapsed: true,
+        },
+      });
+      savedMessageId = savedMessage.id;
+      console.log(`Created tool call message with ID: ${savedMessageId}`);
+    }
+    
+    sendJSON({ 
+      type: 'tool_call', 
+      name: toolName, 
+      args: toolArgs,
+      id: toolCall.id,
+      index: toolCall.index,
+      messageId: savedMessageId
+    });
+
+    // Debug: Log available tools
+    console.log('Available tools:', Array.from(toolMap.keys()));
+    
+    // Find and execute the tool
+    const toolInstance = toolMap.get(toolName);
+    if (!toolInstance) {
+      const errorMessage = `Tool ${toolName} not found. Available tools: ${Array.from(toolMap.keys()).join(', ')}`;
+      console.error(errorMessage);
+      sendJSON({ type: 'error', message: errorMessage });
+      return null;
+    }
+
+    console.log(`Executing tool: ${toolName}`);
+    const result = await toolInstance.execute(toolArgs);
+    console.log(`Tool ${toolName} completed successfully`);
+
+    // Update the existing message with the result
+    if (sessionId && savedMessageId) {
+      await prisma.message.update({
+        where: { id: savedMessageId },
+        data: {
+          content: `Tool ${toolName} executed`,
+          toolResult: JSON.stringify(result),
+        },
+      });
+      console.log(`Updated tool call message ID: ${savedMessageId} with result`);
+    }
+
+    // Send tool result to frontend
+    sendJSON({ 
+      type: 'tool_result', 
+      name: toolName, 
+      result: result,
+      id: toolCall.id,
+      index: toolCall.index,
+      messageId: savedMessageId
+    });
+
+    return {
+      toolName,
+      toolArgs,
+      result,
+      tool: toolInstance,
+      messageId: savedMessageId // Add message ID for frontend reference
+    };
+  } catch (error) {
+    console.error('Tool execution error:', error);
+    const errorMessage = `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`;
+    sendJSON({ type: 'error', message: errorMessage });
+    return null;
+  }
+}
+
+// Generate followup messages from tool executions
+function generateFollowupMessages(
+  toolExecutions: ToolExecution[],
+  filteredMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
+): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+  const followupMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
+  
+  // Group tools by their followup configuration
+  const toolsWithFollowup = toolExecutions.filter(execution => 
+    execution.tool?.followup?.enabled
+  );
+
+  if (toolsWithFollowup.length > 0) {
+    // Create system message combining all followup prompts
+    const systemPrompts = toolsWithFollowup
+      .map(execution => execution.tool.followup.systemPrompt)
+      .filter(prompt => prompt)
+      .join('\n\n');
+    
+    const combinedSystemPrompt = systemPrompts || 
+      "You are a helpful assistant. Based on the tool results in the conversation, provide a comprehensive and helpful response to the user's question. Analyze and summarize the information clearly.";
+
+    followupMessages.push({
+      role: 'system',
+      content: combinedSystemPrompt
+    });
+
+    // Add original conversation
+    followupMessages.push(...filteredMessages);
+
+    // Add tool results, each processed by its own filter
+    toolExecutions.forEach(execution => {
+      const filteredResult = execution.tool?.followup?.filterResult
+        ? execution.tool.followup.filterResult(execution.result)
+        : execution.result;
+
+      followupMessages.push({
+        role: 'assistant',
+        content: `Tool ${execution.toolName} executed with result: ${filteredResult}\n\n`
+      });
+    });
+  } else {
+    // Default followup behavior when no specific followup config
+    followupMessages.push({
+      role: 'system',
+      content: "You are a helpful assistant. Based on the tool results in the conversation, provide a comprehensive and helpful response to the user's question. Analyze and summarize the information clearly."
+    });
+
+    followupMessages.push(...filteredMessages);
+
+    toolExecutions.forEach(execution => {
+      followupMessages.push({
+        role: 'assistant',
+        content: `Tool ${execution.toolName} executed with result: ${execution.result}`
+      });
+    });
+  }
+
+  return followupMessages;
+}
+
+// Create LLM completion request parameters
+function createChatParams(
+  model: string,
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+  includeTools: boolean,
+  currentRound: number
+): OpenAI.Chat.Completions.ChatCompletionCreateParams {
+  const openaiTools = includeTools ? convertToolsToOpenAIFormat() : [];
+  
+  // Enhanced system message that encourages concurrent tool usage
+  let systemContent = "You are a helpful assistant. When you use tools to gather information, you MUST always provide a comprehensive response based on the tool results. After calling tools and receiving results, you MUST analyze and summarize the information for the user in a clear and helpful way. Never end your response with just a tool call - always follow up with explanatory text.";
+  
+  if (includeTools && openaiTools.length > 0) {
+    systemContent += "\n\nIMPORTANT: You can call multiple tools simultaneously in a single response when needed. For example, you can perform multiple searches at once to gather comprehensive information from different sources or search for different aspects of a topic. Don't hesitate to use multiple tools when it would provide better, more complete answers.";
+    
+    if (currentRound >= MAX_TOOL_CALL_ROUNDS) {
+      systemContent += `\n\nIMPORTANT: This is your final opportunity to call tools (round ${currentRound}/${MAX_TOOL_CALL_ROUNDS}). Please make all necessary tool calls now, as you won't have another chance after this response.`;
+    } else {
+      systemContent += `\n\nNote: You have ${MAX_TOOL_CALL_ROUNDS - currentRound} more rounds of tool calls available if needed.`;
+    }
+  }
+
+  const systemMessage: OpenAI.Chat.Completions.ChatCompletionMessageParam = {
+    role: 'system',
+    content: systemContent
+  };
+
+  // Filter out any existing system messages and add our enhanced one
+  const messagesWithoutSystem = messages.filter(msg => msg.role !== 'system');
+  const allMessages = [systemMessage, ...messagesWithoutSystem];
+
+  return {
+    model: model || 'gpt-4o-mini',
+    messages: allMessages,
+    stream: true,
+    tools: includeTools && openaiTools.length > 0 ? openaiTools : undefined,
+    tool_choice: includeTools && openaiTools.length > 0 ? 'auto' : undefined,
+  };
 }
 
 // Save message to database
@@ -64,7 +281,7 @@ export async function createChatStream(request: ChatRequest): Promise<ReadableSt
   console.log('Received messages:', messages, 'Model:', model, 'SessionId:', sessionId);
 
   // Filter messages for LLM (only user, assistant, system)
-  const filteredMessages = filterMessagesForLLM(messages);
+  let currentMessages = filterMessagesForLLM(messages);
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -74,33 +291,9 @@ export async function createChatStream(request: ChatRequest): Promise<ReadableSt
       };
 
       try {
-        // Prepare OpenAI chat completion request
-        const openaiTools = convertToolsToOpenAIFormat();
-        const systemMessage: OpenAI.Chat.Completions.ChatCompletionMessageParam = {
-          role: 'system',
-          content: "You are a helpful assistant. When you use tools to gather information, you MUST always provide a comprehensive response based on the tool results. After calling a tool and receiving results, you MUST analyze and summarize the information for the user in a clear and helpful way. Never end your response with just a tool call - always follow up with explanatory text."
-        };
-
-        const allMessages = [systemMessage, ...filteredMessages];
-
-        const chatParams: OpenAI.Chat.Completions.ChatCompletionCreateParams = {
-          model: model || 'gpt-4o-mini',
-          messages: allMessages,
-          stream: true,
-          tools: openaiTools.length > 0 ? openaiTools : undefined,
-          tool_choice: openaiTools.length > 0 ? 'auto' : undefined,
-        };
-
-        const result = await openaiClient.chat.completions.create(chatParams);
-
-        let hasToolCalls = false;
-        const toolCalls: OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta.ToolCall[] = [];
-        const toolResults: Array<{ toolName: string; result: string; tool?: any }> = [];
-        let assistantMessageContent = '';
-
         // Save user message if sessionId exists
-        if (sessionId && filteredMessages.length > 0) {
-          const lastMessage = filteredMessages[filteredMessages.length - 1];
+        if (sessionId && currentMessages.length > 0) {
+          const lastMessage = currentMessages[currentMessages.length - 1];
           if (lastMessage.role === 'user') {
             await saveMessage(sessionId, {
               role: lastMessage.role,
@@ -109,203 +302,152 @@ export async function createChatStream(request: ChatRequest): Promise<ReadableSt
           }
         }
 
-        for await (const chunk of result) {
-          const choice = chunk.choices[0];
-          if (!choice) continue;
+        let currentRound = 1;
+        let allAssistantContent = '';
 
-          const delta = choice.delta;
+        // Main conversation loop with multi-round tool support
+        while (currentRound <= MAX_TOOL_CALL_ROUNDS) {
+          const includeTools = currentRound <= MAX_TOOL_CALL_ROUNDS;
+          const chatParams = createChatParams(model || 'gpt-4o-mini', currentMessages, includeTools, currentRound);
+          
+          const result = await openaiClient.chat.completions.create(chatParams);
 
-          // Handle tool calls
-          if (delta.tool_calls) {
-            hasToolCalls = true;
-            for (const toolCall of delta.tool_calls) {
-              const index = toolCall.index;
+          let hasToolCalls = false;
+          const toolCalls: OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta.ToolCall[] = [];
+          let roundAssistantContent = '';
 
-              // Initialize tool call if not exists
-              if (!toolCalls[index]) {
-                toolCalls[index] = {
-                  index: index,
-                  id: toolCall.id || '',
-                  type: 'function',
-                  function: { name: '', arguments: '' }
-                };
-              }
+          // Process streaming response
+          for await (const chunk of result as AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>) {
+            const choice = chunk.choices[0];
+            if (!choice) continue;
 
-              // Update tool call data
-              if (toolCall.function?.name) {
-                toolCalls[index].function!.name += toolCall.function.name;
-              }
-              if (toolCall.function?.arguments) {
-                toolCalls[index].function!.arguments += toolCall.function.arguments;
-              }
-            }
-          }
+            const delta = choice.delta;
 
-          // Handle text content
-          if (delta.content) {
-            assistantMessageContent += delta.content;
-            sendJSON({ type: 'text_chunk', content: delta.content });
-          }
+            // Handle tool calls
+            if (delta.tool_calls) {
+              hasToolCalls = true;
+              for (const toolCall of delta.tool_calls) {
+                const index = toolCall.index;
 
-          // Handle finish reason
-          if (choice.finish_reason) {
-            // Execute tool calls if any
-            if (hasToolCalls && choice.finish_reason === 'tool_calls') {
-              // Execute all tool calls
-              for (const toolCall of toolCalls) {
-                if (toolCall.function?.name && toolCall.function?.arguments) {
-                  try {
-                    const toolName = toolCall.function.name;
-                    const toolArgs = JSON.parse(toolCall.function.arguments);
+                // Initialize tool call if not exists
+                if (!toolCalls[index]) {
+                  toolCalls[index] = {
+                    index: index,
+                    id: toolCall.id || '',
+                    type: 'function',
+                    function: { name: '', arguments: '' }
+                  };
+                }
 
-                    console.log('Tool call detected:', toolName, toolArgs);
-                    sendJSON({ type: 'tool_call', name: toolName, args: toolArgs });
-
-                    // Save tool call message
-                    if (sessionId) {
-                      await saveMessage(sessionId, {
-                        role: 'tool_call',
-                        content: `Calling ${toolName}`,
-                        toolName: toolName,
-                        toolArgs: toolArgs,
-                      });
-                    }
-
-                    // Find and execute the tool
-                    const toolInstance = tools.find(t => t.name === toolName);
-                    if (toolInstance) {
-                      const result = await toolInstance.execute(toolArgs);
-
-                      // Store tool result for potential follow-up
-                      toolResults.push({
-                        toolName: toolName,
-                        result: result,
-                        tool: toolInstance
-                      });
-
-                      // Send tool result to frontend
-                      sendJSON({ type: 'tool_result', name: toolName, result: result });
-
-                      // Save tool result message
-                      if (sessionId) {
-                        await saveMessage(sessionId, {
-                          role: 'tool_result',
-                          content: `Tool result for ${toolName}`,
-                          toolName: toolName,
-                          toolResult: result,
-                        });
-                      }
-                    }
-                  } catch (error) {
-                    console.error('Tool execution error:', error);
-                    sendJSON({ type: 'error', message: `Tool execution failed: ${error}` });
-                  }
+                // Update tool call data
+                if (toolCall.function?.name) {
+                  toolCalls[index].function!.name += toolCall.function.name;
+                }
+                if (toolCall.function?.arguments) {
+                  toolCalls[index].function!.arguments += toolCall.function.arguments;
                 }
               }
-              // Generate follow-up response with tool results
-              // Check if any tools have followup configuration
-              const toolsWithFollowup = toolResults.filter(result =>
-                result.tool?.followup?.enabled
-              );
+            }
 
-              if (toolsWithFollowup.length > 0) {
-                // Use the first tool's followup configuration
-                const primaryTool = toolsWithFollowup[0];
-                const followupConfig = primaryTool.tool.followup;
+            // Handle text content
+            if (delta.content) {
+              roundAssistantContent += delta.content;
+              allAssistantContent += delta.content;
+              sendJSON({ type: 'text_chunk', content: delta.content });
+            }
 
-                // Create follow-up messages with tool results
-                const toolResultMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = toolResults.map(result => {
-                  const filteredResult = result.tool?.followup?.filterResult
-                    ? result.tool.followup.filterResult(result.result)
-                    : result.result;
-
-                  return {
-                    role: 'assistant' as const,
-                    content: `Tool ${result.toolName} executed with result: ${filteredResult}`
-                  };
+            // Handle finish reason
+            if (choice.finish_reason) {
+              if (hasToolCalls && choice.finish_reason === 'tool_calls') {
+                console.log(`Finish reason: tool_calls, found ${toolCalls.length} tool calls`);
+                
+                // Log all tool calls before execution
+                toolCalls.forEach((toolCall, index) => {
+                  console.log(`Tool call ${index}:`, {
+                    name: toolCall.function?.name,
+                    arguments: toolCall.function?.arguments,
+                    hasName: !!toolCall.function?.name,
+                    hasArgs: !!toolCall.function?.arguments
+                  });
                 });
+                
+                // Execute all tool calls concurrently
+                const validToolCalls = toolCalls.filter(toolCall => 
+                  toolCall.function?.name && toolCall.function?.arguments
+                );
+                
+                console.log(`Valid tool calls: ${validToolCalls.length} of ${toolCalls.length}`);
+                
+                const toolExecutionPromises = validToolCalls.map(toolCall => 
+                  executeToolConcurrently(toolCall, sessionId, sendJSON)
+                );
 
-                const followUpMessages = [
-                  {
-                    role: 'system' as const,
-                    content: followupConfig.systemPrompt || "You are a helpful assistant. Based on the tool results in the conversation, provide a comprehensive and helpful response to the user's question. Analyze and summarize the information clearly."
-                  },
-                  ...filteredMessages,
-                  ...toolResultMessages
-                ];
+                let toolExecutions: ToolExecution[] = [];
+                try {
+                  const results = await Promise.all(toolExecutionPromises);
+                  toolExecutions = results.filter((execution): execution is ToolExecution => execution !== null);
+                } catch (error) {
+                  console.error('Error in concurrent tool execution:', error);
+                  sendJSON({ type: 'error', message: `Concurrent tool execution failed: ${error}` });
+                }
 
-                const followUpResult = await openaiClient.chat.completions.create({
-                  model: model || 'gpt-4o-mini',
-                  messages: followUpMessages,
-                  stream: true,
-                });
+                console.log(`Successful tool executions: ${toolExecutions.length}`);
 
-                for await (const followUpChunk of followUpResult) {
-                  const followUpChoice = followUpChunk.choices[0];
-                  if (!followUpChoice) continue;
-
-                  if (followUpChoice.delta.content) {
-                    assistantMessageContent += followUpChoice.delta.content;
-                    sendJSON({ type: 'text_chunk', content: followUpChoice.delta.content });
+                if (toolExecutions.length > 0) {
+                  // Generate followup messages for next round
+                  const followupMessages = generateFollowupMessages(toolExecutions, currentMessages);
+                  currentMessages = followupMessages;
+                  currentRound++;
+                  
+                  // Continue to next round for followup processing
+                  break;
+                } else {
+                  // No successful tool executions, end here
+                  if (sessionId && allAssistantContent.trim()) {
+                    await saveMessage(sessionId, {
+                      role: 'assistant',
+                      content: allAssistantContent.trim(),
+                    });
                   }
-
-                  if (followUpChoice.finish_reason) {
-                    break;
-                  }
+                  sendJSON({ type: 'end' });
+                  controller.close();
+                  return;
                 }
               } else {
-                // Fallback to default followup behavior
-                console.log('No tools with followup configuration, using default behavior');
-
-                const defaultFollowUpMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-                  {
-                    role: 'system',
-                    content: "You are a helpful assistant. Based on the tool results in the conversation, provide a comprehensive and helpful response to the user's question. Analyze and summarize the information clearly."
-                  },
-                  ...filteredMessages,
-                  ...toolResults.map(result => ({
-                    role: 'assistant' as const,
-                    content: `Tool ${result.toolName} executed with result: ${result.result}`
-                  }))
-                ];
-
-                const followUpResult = await openaiClient.chat.completions.create({
-                  model: model || 'gpt-4o-mini',
-                  messages: defaultFollowUpMessages,
-                  stream: true,
-                });
-
-                for await (const followUpChunk of followUpResult) {
-                  const followUpChoice = followUpChunk.choices[0];
-                  if (!followUpChoice) continue;
-
-                  if (followUpChoice.delta.content) {
-                    assistantMessageContent += followUpChoice.delta.content;
-                    sendJSON({ type: 'text_chunk', content: followUpChoice.delta.content });
-                  }
-
-                  if (followUpChoice.finish_reason) {
-                    break;
-                  }
+                // No tool calls or different finish reason, conversation is complete
+                if (sessionId && allAssistantContent.trim()) {
+                  await saveMessage(sessionId, {
+                    role: 'assistant',
+                    content: allAssistantContent.trim(),
+                  });
                 }
+                sendJSON({ type: 'end' });
+                controller.close();
+                return;
               }
             }
+          }
 
-            // Save assistant message
-            if (sessionId && assistantMessageContent.trim()) {
+          // If we reach here without tool calls, end the conversation
+          if (!hasToolCalls) {
+            if (sessionId && allAssistantContent.trim()) {
               await saveMessage(sessionId, {
                 role: 'assistant',
-                content: assistantMessageContent.trim(),
+                content: allAssistantContent.trim(),
               });
             }
             break;
           }
         }
+
+        // End conversation after max rounds
+        sendJSON({ type: 'end' });
+        controller.close();
+
       } catch (e) {
         console.error('Chat stream error:', e);
         const errorPayload = { type: 'error', message: (e as Error).message };
         sendJSON(errorPayload);
-      } finally {
         sendJSON({ type: 'end' });
         controller.close();
       }

@@ -13,6 +13,9 @@ export interface ChatMessage {
     toolName: string;
     toolArgs?: any;
     toolResult?: any;
+    messageId?: number; // Database ID for unique identification
+    id?: string; // OpenAI tool call ID
+    index?: number; // OpenAI tool call index
   }>;
 }
 
@@ -54,21 +57,22 @@ export function useChatMessages({ sessionId, model = 'gpt-4o-mini', onSessionCre
 
         // Group messages and attach tool calls to assistant messages
         const displayMessages: ChatMessage[] = [];
-        let currentToolCalls: Array<{toolName: string; toolArgs?: any; toolResult?: any}> = [];
+        let currentToolCalls: Array<{
+          toolName: string; 
+          toolArgs?: any; 
+          toolResult?: any; 
+          messageId?: number;
+        }> = [];
 
         for (const msg of allMessages) {
           if (msg.role === 'tool_call') {
-            // Collect tool call
+            // Each tool_call message now contains both args and result
             currentToolCalls.push({
               toolName: msg.toolName,
               toolArgs: msg.toolArgs,
+              toolResult: msg.toolResult,
+              messageId: msg.id,
             });
-          } else if (msg.role === 'tool_result') {
-            // Update corresponding tool call with result
-            const toolCall = currentToolCalls.find(tc => tc.toolName === msg.toolName);
-            if (toolCall) {
-              toolCall.toolResult = msg.toolResult;
-            }
           } else if (msg.role === 'user' || msg.role === 'assistant') {
             // Add user message or assistant message with tool calls
             const messageToAdd: ChatMessage = { ...msg };
@@ -162,7 +166,14 @@ export function useChatMessages({ sessionId, model = 'gpt-4o-mini', onSessionCre
 
     let assistantMessage: ChatMessage = { role: 'assistant', content: '', toolCalls: [] };
     let messageIndex = newMessages.length;
-    const currentToolCalls: Array<{toolName: string; toolArgs?: any; toolResult?: any}> = [];
+    const currentToolCalls: Array<{
+      toolName: string; 
+      toolArgs?: any; 
+      toolResult?: any; 
+      messageId?: number;
+      id?: string;
+      index?: number;
+    }> = [];
 
     try {
       const response = await fetch('/api/chat', {
@@ -194,23 +205,44 @@ export function useChatMessages({ sessionId, model = 'gpt-4o-mini', onSessionCre
             if (data.type === 'tool_call') {
               setToolStatus({ name: data.name, args: data.args });
 
-              // Add or update tool call in the current collection
-              const existingIndex = currentToolCalls.findIndex(tc => tc.toolName === data.name);
-              if (existingIndex >= 0) {
-                currentToolCalls[existingIndex] = { toolName: data.name, toolArgs: data.args };
-              } else {
-                currentToolCalls.push({ toolName: data.name, toolArgs: data.args });
-              }
+              // Add tool call to the collection with unique identifiers
+              currentToolCalls.push({ 
+                toolName: data.name, 
+                toolArgs: data.args,
+                messageId: data.messageId,
+                id: data.id,
+                index: data.index
+              });
 
             } else if (data.type === 'tool_result') {
               setToolStatus({ name: data.name, args: data.args, completed: true });
 
-              // Update tool call with result
-              const existingIndex = currentToolCalls.findIndex(tc => tc.toolName === data.name);
-              if (existingIndex >= 0) {
-                currentToolCalls[existingIndex].toolResult = data.result;
+              // Find the tool call by messageId (most reliable) or by OpenAI ID/index
+              let pendingIndex = -1;
+              if (data.messageId) {
+                pendingIndex = currentToolCalls.findIndex(tc => tc.messageId === data.messageId);
+              } else if (data.id) {
+                pendingIndex = currentToolCalls.findIndex(tc => tc.id === data.id);
+              } else if (data.index !== undefined) {
+                pendingIndex = currentToolCalls.findIndex(tc => tc.index === data.index);
               } else {
-                currentToolCalls.push({ toolName: data.name, toolResult: data.result });
+                // Fallback: find first pending call with same name
+                pendingIndex = currentToolCalls.findIndex(tc => 
+                  tc.toolName === data.name && !tc.toolResult
+                );
+              }
+
+              if (pendingIndex >= 0) {
+                currentToolCalls[pendingIndex].toolResult = data.result;
+              } else {
+                // If no pending call found, add a new one (shouldn't normally happen)
+                currentToolCalls.push({ 
+                  toolName: data.name, 
+                  toolResult: data.result,
+                  messageId: data.messageId,
+                  id: data.id,
+                  index: data.index
+                });
               }
 
             } else if (data.type === 'text_chunk') {

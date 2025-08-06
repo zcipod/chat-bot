@@ -12,6 +12,10 @@ RUN npm run build
 # Stage 2: Run the application
 FROM node:20-slim
 
+RUN apt-get update -y && apt-get install -y \
+    openssl vim curl \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Copy only necessary files from the builder stage
